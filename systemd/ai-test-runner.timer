@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll Polska 2038 PRs every ten minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/10:00
+AccuracySec=1s
+Unit=ai-test-runner.service
+
+[Install]
+WantedBy=timers.target

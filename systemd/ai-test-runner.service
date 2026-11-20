@@ -1,0 +1,19 @@
+[Unit]
+Description=AI Test Runner for Polska 2038
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/ai-test-runner
+StateDirectory=ai-test-runner
+StateDirectoryMode=0700
+ProtectSystem=full
+EnvironmentFile=-/etc/ai-test-runner/runner.conf
+ExecStart=/usr/bin/python3 -I /opt/ai-test-runner/agent_testow_linux.py --run
+TimeoutStartSec=90min
+KillMode=mixed
+TimeoutStopSec=90s
