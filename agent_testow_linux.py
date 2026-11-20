@@ -77,19 +77,30 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def eligible(pr: dict) -> bool:
-    head = pr.get("head") or {}
-    repo = head.get("repo") or {}
-    user = head.get("user") or {}
+def authorized(pr: object) -> bool:
+    if not isinstance(pr, dict) or not isinstance(pr.get("head"), dict):
+        return False
+    head = pr["head"]
+    repo, user = head.get("repo"), head.get("user")
+    if not isinstance(repo, dict) or not isinstance(user, dict):
+        return False
+    sha, ref = head.get("sha"), head.get("ref")
+    repo_name, login = repo.get("full_name"), user.get("login")
+    labels = pr.get("labels")
     return (
         pr.get("state") == "open"
         and type(pr.get("number")) is int and pr["number"] > 0
-        and SHA_RE.fullmatch(str(head.get("sha", ""))) is not None
-        and repo.get("full_name", "").lower() == REPO.lower()
-        and user.get("login", "").lower() == OWNER.lower()
-        and str(head.get("ref", "")).startswith("claude/")
-        and LABEL in {item.get("name") for item in pr.get("labels", []) if isinstance(item, dict)}
+        and isinstance(sha, str) and SHA_RE.fullmatch(sha) is not None
+        and isinstance(repo_name, str) and repo_name.lower() == REPO.lower()
+        and isinstance(login, str) and login.lower() == OWNER.lower()
+        and isinstance(ref, str) and ref.startswith("claude/")
+        and isinstance(labels, list)
+        and any(isinstance(item, dict) and item.get("name") == LABEL for item in labels)
     )
+
+
+def eligible(pr: object, *, allow_draft: bool = False) -> bool:
+    return authorized(pr) and (pr.get("draft") is False or (allow_draft and pr.get("draft") is True))
 
 
 def wait_for_process_group(group: int) -> None:
@@ -416,23 +427,26 @@ def render_report(record: dict) -> str:
     return report
 
 
-def current_head_matches(number: int, sha: str, env: dict) -> bool:
+def current_head_matches(number: int, sha: str, env: dict, *, draft: bool | None = None) -> bool:
+    # Publication checks the existing result's authorization and SHA independently of draft status.
     current = api(f"pulls/{number}", env=env)
-    return (isinstance(current, dict) and eligible(current)
-            and current["number"] == number and current["head"]["sha"] == sha)
+    return (authorized(current)
+            and current["number"] == number and current["head"]["sha"] == sha
+            and (draft is None or current.get("draft") is draft))
 
 
 def execute(pr: dict, env: dict, *, publish: bool, e2e_file: str | None = None,
-            capture_visual: bool = False) -> Path:
-    number, sha = pr["number"], pr["head"]["sha"]
+            capture_visual: bool = False, allow_draft: bool = False) -> Path:
+    if not eligible(pr, allow_draft=allow_draft):
+        raise RuntimeError("PR nie spełnia zasad autoryzacji do testów.")
+    number, sha, draft = pr["number"], pr["head"]["sha"], pr["draft"]
     path = result_path(number, sha, e2e_file, capture_visual)
     if path.exists() or previously_reported(number, sha, e2e_file, capture_visual):
         raise RuntimeError(f"PR #{number}: wynik lub znacznik już istnieje.")
-    # Revalidate both authorization and exact HEAD immediately before fetching.
-    if not current_head_matches(number, sha, env):
-        raise RuntimeError(f"PR #{number}: SHA lub autoryzacja zmieniły się.")
     with active_run(number, sha) as guard:
         prepare_workspace()
+        if not current_head_matches(number, sha, env, draft=draft):
+            raise RuntimeError(f"PR #{number}: zmienił się SHA, status lub autoryzacja.")
         return execute_job(number, sha, path, guard=guard, publish=publish,
                            e2e_file=e2e_file, capture_visual=capture_visual)
 
@@ -742,9 +756,13 @@ def main() -> int:
                         help="Tylko --run --no-publish: wygeneruj wzorce EP do ręcznej oceny")
     parser.add_argument("--pr-number", type=int, default=None,
                         help="Testuj wskazany autoryzowany PR zamiast pierwszego oczekującego")
+    parser.add_argument("--allow-draft", action="store_true",
+                        help="Z --pr-number: dopuść autoryzowany PR w statusie Draft")
     args = parser.parse_args()
     if args.pr_number is not None and args.pr_number < 1:
         parser.error("--pr-number musi być dodatnią liczbą całkowitą")
+    if args.allow_draft and args.pr_number is None:
+        parser.error("--allow-draft wymaga --pr-number")
     if args.no_publish and not args.run:
         parser.error("--no-publish wymaga --run")
     if args.capture_visual_baselines:
@@ -763,16 +781,22 @@ def main() -> int:
             require_no_active_run()
         env = github_env()
         publish = args.run and not args.no_publish
+        if args.pr_number is not None:
+            pr = api(f"pulls/{args.pr_number}", env=env)
+            if not authorized(pr) or pr["number"] != args.pr_number:
+                raise RuntimeError(f"PR #{args.pr_number} nie jest otwarty lub nie spełnia zasad autoryzacji.")
+            if not eligible(pr, allow_draft=args.allow_draft):
+                if pr.get("draft") is True:
+                    raise RuntimeError(f"PR #{args.pr_number} jest Draft. Wymagane --allow-draft.")
+                raise RuntimeError(f"PR #{args.pr_number} ma nieznany status gotowości.")
+            candidates = [pr]
         if publish and publish_pending(env, args.pr_number):
             return 0
-        prs = api("pulls?state=open&per_page=100", env=env)
-        if not isinstance(prs, list):
-            raise RuntimeError("Nieprawidłowa odpowiedź listy PR-ów.")
-        candidates = sorted((pr for pr in prs if eligible(pr)), key=lambda pr: pr["number"])
-        if args.pr_number is not None:
-            candidates = [pr for pr in candidates if pr["number"] == args.pr_number]
-            if not candidates:
-                raise RuntimeError(f"PR #{args.pr_number} nie jest otwarty lub nie spełnia zasad autoryzacji.")
+        if args.pr_number is None:
+            prs = api("pulls?state=open&per_page=100", env=env)
+            if not isinstance(prs, list):
+                raise RuntimeError("Nieprawidłowa odpowiedź listy PR-ów.")
+            candidates = sorted((pr for pr in prs if eligible(pr)), key=lambda pr: pr["number"])
         for pr in candidates:
             number, sha = pr["number"], pr["head"]["sha"]
             path = result_path(number, sha, args.e2e_file, args.capture_visual_baselines)
@@ -782,7 +806,7 @@ def main() -> int:
             print(f"PLAN: PR #{number} SHA {sha}")
             if args.run:
                 path = execute(pr, env, publish=publish, e2e_file=args.e2e_file,
-                               capture_visual=args.capture_visual_baselines)
+                               capture_visual=args.capture_visual_baselines, allow_draft=args.allow_draft)
                 if publish:
                     notify_ntfy(path)
                     publish_result(path, read_result(path), env)
