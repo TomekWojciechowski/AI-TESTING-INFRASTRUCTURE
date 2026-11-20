@@ -24,4 +24,6 @@ Testy jednostkowe można uruchomić w Pythonie 3.10 lub nowszym. Używają mock�
 python3 -m unittest discover -s tests -v
 ```
 
+Ręczny test timeoutu i zatrzymywania rzeczywistego kontenera opisano w [instrukcji dla Ubuntu LXC](docs/PODMAN_TIMEOUT_INTEGRATION.md).
+
 Zobacz [architekturę](docs/ARCHITECTURE.md) i [procedurę wdrożenia](docs/DEPLOYMENT.md). Jednostki w katalogu `systemd/` są gotowe do ręcznej instalacji po akceptacji.
