@@ -21,9 +21,9 @@ SHA = "1" * 40
 NEW_SHA = "2" * 40
 
 
-def pull(sha=SHA):
+def pull(sha=SHA, *, draft=False):
     return {
-        "number": 7, "state": "open", "labels": [{"name": runner.LABEL}],
+        "number": 7, "state": "open", "draft": draft, "labels": [{"name": runner.LABEL}],
         "head": {"sha": sha, "repo": {"full_name": runner.REPO},
                  "user": {"login": runner.OWNER}, "ref": "claude/test"},
     }
@@ -99,6 +99,72 @@ class RunnerTests(unittest.TestCase):
         self.post.assert_not_called()
         self.assertFalse(self.path().exists())
 
+    def test_automatic_run_skips_draft_and_selects_ready_pr(self):
+        draft = dict(pull(draft=True), number=6)
+        self.api.side_effect = lambda endpoint, **kwargs: (
+            [draft, self.head] if endpoint.startswith("pulls?") else self.github(endpoint, **kwargs)
+        )
+        self.assertEqual(self.invoke("--run", "--no-publish"), 0)
+        fetches = [call.args[0][-1] for call in self.git.call_args_list if "fetch" in call.args[0]]
+        self.assertEqual(fetches, ["refs/pull/7/head"])
+        self.assertEqual(self.result()["outcome"], "PASS")
+
+    def test_automatic_dry_run_and_execution_skip_draft(self):
+        self.head = pull(draft=True)
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.invoke("--run"), 0)
+        self.assertNotIn("PLAN:", self.stdout.getvalue())
+        self.git.assert_not_called()
+        self.podman.assert_not_called()
+        self.post.assert_not_called()
+
+    def test_automatic_run_requires_local_tests_label(self):
+        self.head["labels"] = []
+        self.assertEqual(self.invoke("--run"), 0)
+        self.git.assert_not_called()
+        self.podman.assert_not_called()
+
+    def test_manual_draft_requires_explicit_flag(self):
+        self.head = pull(draft=True)
+        with self.assertRaisesRegex(RuntimeError, "Wymagane --allow-draft"):
+            self.invoke("--run", "--pr-number", "7")
+        self.git.assert_not_called()
+        self.podman.assert_not_called()
+
+    def test_allow_draft_requires_manual_number(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.invoke("--run", "--allow-draft")
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--allow-draft wymaga --pr-number", self.stderr.getvalue())
+        self.api.assert_not_called()
+        self.git.assert_not_called()
+
+    def test_manually_authorized_draft_runs_and_is_deduplicated(self):
+        self.head = pull(draft=True)
+        args = ("--run", "--pr-number", "7", "--allow-draft")
+        self.assertEqual(self.invoke(*args), 0)
+        self.assertEqual(self.invoke(*args), 0)
+        self.head = pull()
+        self.assertEqual(self.invoke("--run"), 0)
+        self.assertEqual(self.result()["github"]["status"], "published")
+        self.assertEqual(self.podman.call_count, 6)
+        self.post.assert_called_once()
+
+    def test_automatic_retry_publishes_saved_draft_result_without_running_tests(self):
+        self.head = pull(draft=True)
+        self.post.side_effect = runner.GitHubError("issues/7/comments", 429)
+        self.invoke("--run", "--pr-number", "7", "--allow-draft")
+        self.assertEqual(self.result()["github"]["status"], "pending")
+
+        self.post.side_effect = lambda body: {"id": 42, "body": body}
+        self.git.reset_mock()
+        self.podman.reset_mock()
+        with self.advance():
+            self.assertEqual(self.invoke("--run"), 0)
+        self.assertEqual(self.result()["github"]["status"], "published")
+        self.git.assert_not_called()
+        self.podman.assert_not_called()
+
     def test_authorization_fields(self):
         self.assertTrue(runner.eligible(pull()))
         edits = [
@@ -116,15 +182,70 @@ class RunnerTests(unittest.TestCase):
                 else:
                     candidate.update(edit)
                 self.assertFalse(runner.eligible(candidate))
+                candidate["draft"] = True
+                self.assertFalse(runner.eligible(candidate, allow_draft=True))
+                self.head = candidate
+                with self.assertRaisesRegex(RuntimeError, "nie spełnia zasad autoryzacji"):
+                    self.invoke("--run", "--pr-number", "7", "--allow-draft")
+        self.git.assert_not_called()
+        self.podman.assert_not_called()
 
-    def test_revalidation_prevents_git_when_head_changes(self):
-        pr = copy.deepcopy(self.head)
-        self.head = pull(NEW_SHA)
-        with self.assertRaisesRegex(RuntimeError, "SHA lub autoryzacja"):
-            runner.execute(pr, {}, publish=True)
+    def test_missing_or_invalid_draft_status_fails_closed(self):
+        candidate = pull()
+        del candidate["draft"]
+        for invalid in (candidate, dict(candidate, draft=0), dict(candidate, draft="false")):
+            self.assertFalse(runner.eligible(invalid))
+            self.assertFalse(runner.eligible(invalid, allow_draft=True))
+
+    def test_revalidation_blocks_fetch_after_sha_status_or_authorization_changes(self):
+        for selected, current, allow_draft in (
+            (pull(), pull(NEW_SHA), False),
+            (pull(), pull(draft=True), False),
+            (pull(), pull(draft=True), True),
+            (pull(), dict(pull(), state="closed"), False),
+            (pull(), dict(pull(), labels=[]), False),
+            (pull(draft=True), pull(), True),
+        ):
+            with self.subTest(selected=selected, current=current):
+                def prepare():
+                    self.head = current
+
+                self.head = copy.deepcopy(selected)
+                with patch.object(runner, "prepare_workspace", side_effect=prepare):
+                    with self.assertRaisesRegex(RuntimeError, "zmienił się SHA, status lub autoryzacja"):
+                        runner.execute(selected, {}, publish=True, allow_draft=allow_draft)
+                self.assertFalse((self.state / runner.ACTIVE_RUN).exists())
         self.git.assert_not_called()
         self.podman.assert_not_called()
         self.assertFalse(self.path().exists())
+
+    def test_github_list_error_never_fetches_or_tests(self):
+        self.api.side_effect = runner.GitHubError("pulls?state=open&per_page=100", 429)
+        with self.assertRaises(runner.GitHubError):
+            self.invoke("--run")
+        self.git.assert_not_called()
+        self.podman.assert_not_called()
+        self.post.assert_not_called()
+
+    def test_github_revalidation_error_never_fetches_or_tests(self):
+        self.api.side_effect = [[self.head], runner.GitHubError("pulls/7", 503)]
+        with patch.object(runner, "prepare_workspace"):
+            with self.assertRaises(runner.GitHubError):
+                self.invoke("--run")
+        self.git.assert_not_called()
+        self.podman.assert_not_called()
+        self.post.assert_not_called()
+        self.assertFalse(self.path().exists())
+        self.assertFalse((self.state / runner.ACTIVE_RUN).exists())
+
+    def test_malformed_github_metadata_fails_closed(self):
+        self.api.side_effect = None
+        for malformed in (None, [], dict(pull(), head="invalid"), dict(pull(), labels=None)):
+            with self.subTest(malformed=malformed):
+                self.api.return_value = [malformed]
+                self.assertEqual(self.invoke("--run"), 0)
+        self.git.assert_not_called()
+        self.podman.assert_not_called()
 
     def test_wrong_fetched_sha_prevents_worktree_and_tests(self):
         self.head = pull(NEW_SHA)
