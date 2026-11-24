@@ -1,39 +1,53 @@
 # AI Test Runner 2.0
 
-Lokalny runner CI dla projektu Polska 2038. Koordynator sprawdza autoryzację PR-a i dokładny SHA, a etapy projektu uruchamia jako `ci-runner` w rootless Podmanie. Wynik trafia do lokalnego JSON przed próbą wysłania komentarza.
+A self-hosted CI runner written in Python. It picks up pull requests from GitHub, verifies that they are authorised and that the exact commit has not changed, and runs the project's test stages (ESLint, Node unit tests, build, Playwright E2E) in **rootless Podman** containers. The result is stored locally before it is posted back to the pull request as a comment.
 
-Na skonfigurowanym Linuksie polecenie bez flag wykonuje dry-run. Odczytuje listę PR-ów z GitHuba oraz lokalny stan i wyświetla pierwszego kandydata.
+I built it to run the full test suite of my [Polska 2038](https://polska2038.pl) web project on my own Linux server, because the end-to-end and visual regression tests need more time and a more stable environment than free hosted runners give.
 
-```bash
-sudo python3 -I agent_testow_linux.py
-```
+*Polish version: [README.pl.md](README.pl.md). Detailed design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (Polish).*
 
-| Flaga | Działanie |
+## What it does
+
+| Step | Detail |
 | --- | --- |
-| `--run` | Obsługuje jedną zaległą publikację albo uruchamia jeden nowy przebieg z raportem. |
-| `--run --no-publish` | Uruchamia jeden przebieg i zachowuje wynik lokalnie. |
-| `--pr-number 123` | Ogranicza wybór PR-a i obsługę publikacji do podanego numeru. |
-| `--pr-number 123 --allow-draft` | Dopuszcza wskazany Draft po sprawdzeniu pełnej autoryzacji. Dodaj `--run`, aby wykonać testy. |
-| `--run --e2e-file e2e/nazwa.spec.js` | Zawęża etap Playwright do wskazanego pliku. |
-| `--run --no-publish --capture-visual-baselines` | Generuje wzorce wizualne do ręcznej oceny. |
+| Select a pull request | Open, ready for review, labelled `local-tests`, from the expected repository and owner, on a `claude/*` branch, with a full 40-character SHA |
+| Re-check before checkout | Reads the PR again right before `git fetch` and compares `FETCH_HEAD` with the authorised SHA; any mismatch stops the run |
+| Run stages | `npm ci --ignore-scripts`, ESLint, Node unit tests, build, Playwright; stops at the first failing stage |
+| Isolate | Podman runs as an unprivileged `ci-runner` user with memory, CPU and PID limits, no capabilities, `no-new-privileges`, and no network after dependency installation |
+| Handle timeouts | Each stage has a time limit; on timeout or interruption the runner stops the process group and confirms the container is gone before releasing the lock |
+| Store the result | Atomic JSON write (`os.replace` + `fsync`) with PR, SHA, scope, per-stage status and timestamps; one result per PR, SHA and scope prevents duplicate runs |
+| Publish | Posts one comment with stage statuses; retries respect GitHub rate-limit headers, and a lost response is reconciled by searching for the comment's random marker instead of posting twice |
+| Schedule | A `systemd` timer starts the runner; a file lock and an `active-run.json` marker prevent overlapping runs |
 
-| Status PR-a | Automatyczny przebieg | Ręczny przebieg z `--run --pr-number 123` |
-| --- | --- | --- |
-| Otwarty, Ready for Review, z `local-tests` i pełną autoryzacją | Kwalifikuje się | Kwalifikuje się |
-| Otwarty Draft, z `local-tests` i pełną autoryzacją | Pomijany | Wymaga `--allow-draft` |
-| Zamknięty, bez `local-tests`, bez pełnej autoryzacji lub z nieznanym statusem gotowości | Pomijany | Odrzucany |
-| Kwalifikujący się PR z zapisanym wynikiem dla tego samego SHA i zakresu | Pomijany | Pomijany |
+## Tests
 
-Pełna autoryzacja obejmuje konto właściciela, oczekiwane repozytorium źródłowe, gałąź `claude/*` i poprawny SHA. Tuż przed pobraniem kodu agent ponownie sprawdza autoryzację, status PR-a i SHA.
-
-Wyniki i stan publikacji są w `/var/lib/ai-test-runner/result-pr-*.json`. Zwykły przebieg, wskazany plik E2E i generowanie wzorców mają odrębne klucze deduplikacji. ntfy jest opcjonalne i domyślnie wyłączone.
-
-Testy jednostkowe można uruchomić w Pythonie 3.10 lub nowszym. Używają mocków GitHuba, Git i Podmana oraz katalogów tymczasowych.
+38 unit tests (Python `unittest`) cover PR authorisation rules, SHA re-checks, stage failures and timeouts, result deduplication, atomic state files and every publication outcome (confirmed, rate-limited, rejected, superseded, unconfirmed). GitHub, Git and Podman are replaced with mocks and temporary directories, so the suite runs anywhere with Python 3.10+:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-Ręczny test timeoutu i zatrzymywania rzeczywistego kontenera opisano w [instrukcji dla Ubuntu LXC](docs/PODMAN_TIMEOUT_INTEGRATION.md).
+A manual integration test for timeouts against a real Podman container is described in [docs/PODMAN_TIMEOUT_INTEGRATION.md](docs/PODMAN_TIMEOUT_INTEGRATION.md).
 
-Zobacz [architekturę](docs/ARCHITECTURE.md) i [procedurę wdrożenia](docs/DEPLOYMENT.md). Jednostki w katalogu `systemd/` są gotowe do ręcznej instalacji po akceptacji.
+## Usage
+
+On a configured Linux host, the command without flags is a dry run: it reads open pull requests and local state and prints the first candidate.
+
+```bash
+sudo python3 -I agent_testow_linux.py
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--run` | Publishes one pending result, or runs one new test pass and reports it |
+| `--run --no-publish` | Runs one pass and keeps the result local |
+| `--pr-number 123` | Limits selection and publication to one pull request |
+| `--pr-number 123 --allow-draft` | Allows a draft PR after the full authorisation check |
+| `--run --e2e-file e2e/name.spec.js` | Runs only one Playwright spec |
+| `--run --no-publish --capture-visual-baselines` | Generates visual baselines for manual review |
+
+Deployment steps and the `systemd` units are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and [systemd/](systemd/).
+
+## Stack
+
+Python 3 (standard library only), Podman (rootless), systemd, GitHub REST API, Git worktrees, Playwright, Proxmox LXC (Ubuntu)
